@@ -1,0 +1,48 @@
+name: Build FF DRAG PRO APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create the project from the part files
+        shell: bash
+        run: |
+          set -euo pipefail
+          count=$(ls ffparts/part*.sh | wc -l)
+          echo "Found $count part files"
+          mkdir -p FFDragPro
+          cd FFDragPro
+          for f in $(ls ../ffparts/part*.sh | sort -V); do
+            echo "Running $f"
+            bash "$f"
+          done
+          echo "Created $(find . -type f | wc -l) files"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      - name: Run unit tests and build APKs
+        working-directory: FFDragPro
+        run: gradle --no-daemon testDebugUnitTest assembleDebug assembleRelease
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: FF-DRAG-PRO-apk
+          path: |
+            FFDragPro/app/build/outputs/apk/debug/*.apk
+            FFDragPro/app/build/outputs/apk/release/*.apk
