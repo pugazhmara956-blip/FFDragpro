@@ -14,15 +14,31 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          count=$(ls ffparts/part*.sh | wc -l)
-          echo "Found $count part files"
-          mkdir -p FFDragPro
-          cd FFDragPro
-          for f in $(ls ../ffparts/part*.sh | sort -V); do
-            echo "Running $f"
-            bash "$f"
-          done
+          echo "Files in the repository:"
+          git ls-files
+          # Find every file holding FF DRAG PRO code, whatever its name or folder.
+          grep -rlI --exclude-dir=.git --exclude-dir=.github "FFDRAG_EOF" . > /tmp/found.txt || true
+          : > /tmp/ordered.txt
+          while IFS= read -r f; do
+            n=$(grep -m1 -oE 'part [0-9]+ of 7' "$f" | grep -oE '[0-9]+' | head -n1 || true)
+            echo "${n:-99} $f" >> /tmp/ordered.txt
+          done < /tmp/found.txt
+          sort -n /tmp/ordered.txt -o /tmp/ordered.txt
+          echo "Part files found:"
+          cat /tmp/ordered.txt
+          count=$(wc -l < /tmp/ordered.txt)
+          if [ "$count" -lt 7 ]; then
+            echo "::error::Found $count part files, expected 7. Check the list above."
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/FFDragPro"
+          cd "$RUNNER_TEMP/FFDragPro"
+          while read -r n f; do
+            echo "Running part $n: $f"
+            bash "$GITHUB_WORKSPACE/${f#./}"
+          done < /tmp/ordered.txt
           echo "Created $(find . -type f | wc -l) files"
+          mv "$RUNNER_TEMP/FFDragPro" "$GITHUB_WORKSPACE/FFDragPro"
 
       - uses: actions/setup-java@v4
         with:
