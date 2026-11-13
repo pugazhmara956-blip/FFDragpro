@@ -1,0 +1,421 @@
+# FF DRAG PRO source, part 1 of 7
+mkdir -p 'app'
+cat > 'app/build.gradle.kts' <<'FFDRAG_EOF'
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}
+
+android {
+    namespace = "com.ffdragpro.app"
+    compileSdk = 35
+
+    defaultConfig {
+        applicationId = "com.ffdragpro.app"
+        minSdk = 26          // Android 8.0+, covers Redmi 14C 5G (ships with Android 14 / HyperOS)
+        targetSdk = 35       // Android 15
+        versionCode = 1
+        versionName = "1.0.0"
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+            // Signed with the local debug key so the release APK installs directly.
+            // Replace with your own signing config before publishing anywhere.
+            signingConfig = signingConfigs.getByName("debug")
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+}
+
+dependencies {
+    // No runtime libraries: the app uses only the Android framework + Kotlin stdlib (small APK).
+    testImplementation("junit:junit:4.13.2")
+}
+FFDRAG_EOF
+mkdir -p 'app'
+cat > 'app/proguard-rules.pro' <<'FFDRAG_EOF'
+# FF DRAG PRO has no reflection-based libraries.
+# Activities, the service and the custom TrainerView (referenced from XML) are kept automatically by AGP.
+FFDRAG_EOF
+mkdir -p 'app/src/main'
+cat > 'app/src/main/AndroidManifest.xml' <<'FFDRAG_EOF'
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Floating panel over other apps (granted by the user in system settings). -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- The floating panel runs as a foreground service only while it is switched on. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- Shows the "floating panel active" notification with a Close button (Android 13+). -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Package visibility: lets the app find launchable apps (to detect and open Free Fire India). -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="market" />
+        </intent>
+    </queries>
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.FFDragPro">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".TrainerActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden"
+            android:exported="false"
+            android:screenOrientation="sensorLandscape"
+            android:theme="@style/Theme.FFDragPro.Fullscreen" />
+
+        <activity
+            android:name=".GuideActivity"
+            android:exported="false"
+            android:label="@string/guide_title" />
+
+        <activity
+            android:name=".StatsActivity"
+            android:exported="false"
+            android:label="@string/stats_title" />
+
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:label="@string/settings_title" />
+
+        <service
+            android:name=".OverlayService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="User-enabled floating companion panel shown over games" />
+        </service>
+    </application>
+</manifest>
+FFDRAG_EOF
+mkdir -p 'app/src/main/java/com/ffdragpro/app'
+cat > 'app/src/main/java/com/ffdragpro/app/DragEvaluator.kt' <<'FFDRAG_EOF'
+package com.ffdragpro.app
+
+import java.util.Locale
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.roundToInt
+import kotlin.math.sqrt
+
+/** Pure scoring logic (no Android imports) so it can be unit tested on the JVM. */
+
+enum class ShotOutcome(val label: String) {
+    HEADSHOT("Headshot"),
+    BODY("Body"),
+    OVERDRAG("Over-drag"),
+    MISS("Miss"),
+    TIMEOUT("Too slow"),
+}
+
+/** Target geometry in world pixels. Y grows downward (Android canvas convention). */
+data class TargetGeometry(
+    val centerX: Float,
+    val headCenterY: Float,
+    val headRadius: Float,
+    val bodyTop: Float,
+    val bodyBottom: Float,
+    val bodyHalfWidth: Float,
+)
+
+/**
+ * One shot.
+ * [verticalErrorMm]: finger millimetres between where the shot landed and the head centre.
+ * Positive = over-drag (above the head), negative = stopped short (below the head).
+ */
+data class ShotRecord(
+    val outcome: ShotOutcome,
+    val reactionMs: Long,
+    val swipeMs: Long,
+    val verticalErrorMm: Float,
+    val fingerSwipeMm: Float,
+    val requiredSwipeMm: Float,
+)
+
+object DragEvaluator {
+
+    fun classify(x: Float, y: Float, t: TargetGeometry, headTolerance: Float): ShotOutcome {
+        val r = t.headRadius * headTolerance
+        val dx = x - t.centerX
+        val dy = y - t.headCenterY
+        if (dx * dx + dy * dy <= r * r) return ShotOutcome.HEADSHOT
+        val halfWidth = max(t.bodyHalfWidth, r)
+        if (abs(dx) <= halfWidth) {
+            if (y < t.headCenterY) return ShotOutcome.OVERDRAG
+            if (y <= t.bodyBottom) return ShotOutcome.BODY
+        }
+        return ShotOutcome.MISS
+    }
+
+    fun pxToMm(px: Float, dpi: Float): Float = px / dpi * 25.4f
+}
+
+data class SessionSummary(
+    val shots: Int,
+    val headshots: Int,
+    val body: Int,
+    val overdrag: Int,
+    val miss: Int,
+    val timeout: Int,
+    val avgReactionMs: Int,
+    val avgSwipeMs: Int,
+    /** Mean signed error of non-headshot attempts (+ over, - short). */
+    val meanSignedErrorMm: Float,
+    val meanAbsErrorMm: Float,
+    /** Standard deviation of the vertical error: lower = more consistent swipes. */
+    val errorSpreadMm: Float,
+    /** Average finger swipe length on headshots, or null if there were none. */
+    val avgHeadshotSwipeMm: Float?,
+) {
+    val headshotPct: Int get() = if (shots == 0) 0 else (headshots * 100f / shots).roundToInt()
+
+    fun coachingTip(weapon: Weapon): String {
+        if (shots == 0) return "No shots recorded."
+        val parts = mutableListOf<String>()
+        when {
+            headshotPct >= 75 ->
+                parts += "Excellent control. Raise the training speed to keep improving."
+            overdrag > body && overdrag >= miss ->
+                parts += String.format(Locale.US, "Most misses went over the head. Shorten your swipe by about %.1f mm.", abs(meanSignedErrorMm))
+            body >= overdrag && body >= miss && body > 0 ->
+                parts += String.format(Locale.US, "Most misses stopped below the head. Swipe about %.1f mm further.", abs(meanSignedErrorMm))
+            miss > 0 ->
+                parts += "Several shots went wide. Line up sideways before the upward flick."
+        }
+        if (timeout * 4 > shots) parts += "Start sooner: put your thumb down as soon as the target appears."
+        if (avgSwipeMs > weapon.maxSwipeMs) {
+            parts += String.format(Locale.US, "Your swipe takes %d ms; aim for under %d ms with the %s.", avgSwipeMs, weapon.maxSwipeMs, weapon.label)
+        }
+        if (parts.isEmpty()) parts += "Keep practising: consistency comes from repeating the same swipe length."
+        return parts.joinToString(" ")
+    }
+
+    companion object {
+        fun from(records: List<ShotRecord>): SessionSummary {
+            val attempted = records.filter { it.outcome != ShotOutcome.TIMEOUT }
+            val nonHeadshots = attempted.filter { it.outcome != ShotOutcome.HEADSHOT }
+            val headshotRecords = records.filter { it.outcome == ShotOutcome.HEADSHOT }
+            val errors = attempted.map { it.verticalErrorMm }
+            return SessionSummary(
+                shots = records.size,
+                headshots = headshotRecords.size,
+                body = records.count { it.outcome == ShotOutcome.BODY },
+                overdrag = records.count { it.outcome == ShotOutcome.OVERDRAG },
+                miss = records.count { it.outcome == ShotOutcome.MISS },
+                timeout = records.count { it.outcome == ShotOutcome.TIMEOUT },
+                avgReactionMs = if (attempted.isEmpty()) 0 else attempted.map { it.reactionMs }.average().roundToInt(),
+                avgSwipeMs = if (attempted.isEmpty()) 0 else attempted.map { it.swipeMs }.average().roundToInt(),
+                meanSignedErrorMm = if (nonHeadshots.isEmpty()) 0f else nonHeadshots.map { it.verticalErrorMm }.average().toFloat(),
+                meanAbsErrorMm = if (errors.isEmpty()) 0f else errors.map { abs(it) }.average().toFloat(),
+                errorSpreadMm = stdDev(errors),
+                avgHeadshotSwipeMm = if (headshotRecords.isEmpty()) null else headshotRecords.map { it.fingerSwipeMm }.average().toFloat(),
+            )
+        }
+
+        private fun stdDev(values: List<Float>): Float {
+            if (values.size < 2) return 0f
+            val mean = values.average()
+            val sumSq = values.sumOf { (it - mean) * (it - mean) }
+            return sqrt(sumSq / (values.size - 1)).toFloat()
+        }
+    }
+}
+FFDRAG_EOF
+mkdir -p 'app/src/main/java/com/ffdragpro/app'
+cat > 'app/src/main/java/com/ffdragpro/app/GameLauncher.kt' <<'FFDRAG_EOF'
+package com.ffdragpro.app
+
+import android.content.ActivityNotFoundException
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.content.pm.ResolveInfo
+import android.net.Uri
+import android.os.Build
+
+/**
+ * Finds and opens the game with a normal launcher intent, exactly like tapping its icon.
+ * Nothing is read from or written to the game.
+ */
+object GameLauncher {
+
+    data class GameApp(val packageName: String, val label: String)
+
+    /** Garena's Free Fire apps are published under this package prefix. */
+    private const val GARENA_PREFIX = "com.dts."
+
+    fun launchableApps(context: Context): List<GameApp> {
+        val pm = context.packageManager
+        val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        val infos = queryActivities(pm, intent)
+        return infos
+            .map { GameApp(it.activityInfo.packageName, it.loadLabel(pm).toString()) }
+            .filter { it.packageName != context.packageName }
+            .distinctBy { it.packageName }
+            .sortedBy { it.label.lowercase() }
+    }
+
+    fun isFreeFire(app: GameApp): Boolean =
+        app.label.contains("free fire", ignoreCase = true) || app.packageName.startsWith(GARENA_PREFIX)
+
+    /** Free Fire apps first (Free Fire India before others), then everything else alphabetically. */
+    fun sortForPicker(apps: List<GameApp>): List<GameApp> =
+        apps.sortedWith(
+            compareByDescending<GameApp> { isFreeFire(it) }
+                .thenByDescending { it.label.contains("india", ignoreCase = true) }
+                .thenBy { it.label.lowercase() }
+        )
+
+    /** The user's chosen game if still installed, otherwise the best Free Fire match, otherwise null. */
+    fun resolveGame(context: Context, prefs: Prefs): GameApp? {
+        val apps = launchableApps(context)
+        prefs.gamePackage?.let { saved -> apps.firstOrNull { it.packageName == saved }?.let { return it } }
+        return sortForPicker(apps.filter { isFreeFire(it) }).firstOrNull()
+    }
+
+    fun launch(context: Context, packageName: String): Boolean {
+        val intent = context.packageManager.getLaunchIntentForPackage(packageName) ?: return false
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+        return try {
+            context.startActivity(intent)
+            true
+        } catch (e: ActivityNotFoundException) {
+            false
+        } catch (e: SecurityException) {
+            false
+        }
+    }
+
+    /** Opens the Play Store search for Free Fire India. */
+    fun openStore(context: Context) {
+        val query = Uri.encode("Free Fire India")
+        val market = Intent(Intent.ACTION_VIEW, Uri.parse("market://search?q=$query&c=apps"))
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        try {
+            context.startActivity(market)
+        } catch (e: ActivityNotFoundException) {
+            val web = Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/search?q=$query&c=apps"))
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            try {
+                context.startActivity(web)
+            } catch (e2: ActivityNotFoundException) {
+                // No store and no browser: nothing else to open.
+            }
+        }
+    }
+
+    private fun queryActivities(pm: PackageManager, intent: Intent): List<ResolveInfo> =
+        if (Build.VERSION.SDK_INT >= 33) {
+            pm.queryIntentActivities(intent, PackageManager.ResolveInfoFlags.of(0L))
+        } else {
+            queryActivitiesLegacy(pm, intent)
+        }
+
+    @Suppress("DEPRECATION")
+    private fun queryActivitiesLegacy(pm: PackageManager, intent: Intent): List<ResolveInfo> =
+        pm.queryIntentActivities(intent, 0)
+}
+FFDRAG_EOF
+mkdir -p 'app/src/main/java/com/ffdragpro/app'
+cat > 'app/src/main/java/com/ffdragpro/app/GuideActivity.kt' <<'FFDRAG_EOF'
+package com.ffdragpro.app
+
+import android.app.Activity
+import android.os.Bundle
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.TextView
+
+class GuideActivity : Activity() {
+
+    private lateinit var prefs: Prefs
+    private lateinit var tvWeaponTitle: TextView
+    private lateinit var tvWeaponTips: TextView
+    private lateinit var tvPersonal: TextView
+    private val tabs = ArrayList<Button>()
+    private var selected = Weapon.SMG
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_guide)
+        prefs = Prefs(this)
+        selected = prefs.weapon
+
+        tvWeaponTitle = findViewById(R.id.tvWeaponTitle)
+        tvWeaponTips = findViewById(R.id.tvWeaponTips)
+        tvPersonal = findViewById(R.id.tvPersonal)
+
+        val row = findViewById<LinearLayout>(R.id.weaponTabs)
+        for (w in Weapon.entries) {
+            val b = layoutInflater.inflate(R.layout.item_tab_button, row, false) as Button
+            b.text = w.label
+            b.setOnClickListener {
+                selected = w
+                render()
+            }
+            row.addView(b)
+            tabs += b
+        }
+        findViewById<Button>(R.id.btnPractice).setOnClickListener {
+            prefs.weapon = selected
+            startActivity(TrainerActivity.intent(this, selected))
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        render()
+    }
+
+    private fun render() {
+        tabs.forEachIndexed { i, b -> b.isSelected = Weapon.entries[i] == selected }
+        tvWeaponTitle.text = getString(R.string.guide_weapon_title, selected.label, selected.examples)
+        tvWeaponTips.text = selected.tips.joinToString("\n\n") { "• $it" }
+        val personal = prefs.headshotSwipe(selected)
+        tvPersonal.text = if (personal != null) {
+            getString(R.string.guide_personal, selected.label, personal.first, personal.second)
+        } else {
+            getString(R.string.guide_personal_none)
+        }
+    }
+}
+FFDRAG_EOF
