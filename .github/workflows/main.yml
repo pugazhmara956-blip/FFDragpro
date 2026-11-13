@@ -10,35 +10,51 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Create the project from the part files
+      - name: Create the project
         shell: bash
         run: |
           set -euo pipefail
           echo "Files in the repository:"
           git ls-files
-          # Find every file holding FF DRAG PRO code, whatever its name or folder.
-          grep -rlI --exclude-dir=.git --exclude-dir=.github "FFDRAG_EOF" . > /tmp/found.txt || true
-          : > /tmp/ordered.txt
-          while IFS= read -r f; do
-            n=$(grep -m1 -oE 'part [0-9]+ of 7' "$f" | grep -oE '[0-9]+' | head -n1 || true)
-            echo "${n:-99} $f" >> /tmp/ordered.txt
-          done < /tmp/found.txt
-          sort -n /tmp/ordered.txt -o /tmp/ordered.txt
-          echo "Part files found:"
-          cat /tmp/ordered.txt
-          count=$(wc -l < /tmp/ordered.txt)
-          if [ "$count" -lt 7 ]; then
-            echo "::error::Found $count part files, expected 7. Check the list above."
-            exit 1
+          dest="$GITHUB_WORKSPACE/FFDragPro"
+          rm -rf "$dest"
+          # 1) Preferred: an uploaded FFDragPro.zip (the complete project).
+          while IFS= read -r z; do
+            rm -rf "$RUNNER_TEMP/zip"
+            if unzip -q -o "$z" -d "$RUNNER_TEMP/zip" 2>/dev/null; then
+              s=$(find "$RUNNER_TEMP/zip" -name settings.gradle.kts -path '*FFDragPro*' | head -n1 || true)
+              if [ -n "$s" ]; then
+                mv "$(dirname "$s")" "$dest"
+                echo "Using project from $z"
+                break
+              fi
+            fi
+          done < <(find . -name '*.zip' -not -path './.git/*')
+          # 2) Otherwise: the 7 part files, in any folder and with any name.
+          if [ ! -d "$dest" ]; then
+            grep -rlI --exclude-dir=.git --exclude='*.yml' --exclude='*.yaml' "FFDRAG_EOF" . > /tmp/found.txt || true
+            : > /tmp/ordered.txt
+            while IFS= read -r f; do
+              n=$(grep -m1 -oE 'part [0-9]+ of 7' "$f" | grep -oE '[0-9]+' | head -n1 || true)
+              echo "${n:-99} $f" >> /tmp/ordered.txt
+            done < /tmp/found.txt
+            sort -n /tmp/ordered.txt -o /tmp/ordered.txt
+            echo "Part files found:"
+            cat /tmp/ordered.txt
+            count=$(wc -l < /tmp/ordered.txt)
+            if [ "$count" -lt 7 ]; then
+              echo "::error::No FFDragPro.zip and only $count of 7 part files found."
+              exit 1
+            fi
+            mkdir -p "$RUNNER_TEMP/parts" && cd "$RUNNER_TEMP/parts"
+            while read -r n f; do
+              echo "Running part $n: $f"
+              bash "$GITHUB_WORKSPACE/${f#./}"
+            done < /tmp/ordered.txt
+            mv "$RUNNER_TEMP/parts" "$dest"
           fi
-          mkdir -p "$RUNNER_TEMP/FFDragPro"
-          cd "$RUNNER_TEMP/FFDragPro"
-          while read -r n f; do
-            echo "Running part $n: $f"
-            bash "$GITHUB_WORKSPACE/${f#./}"
-          done < /tmp/ordered.txt
-          echo "Created $(find . -type f | wc -l) files"
-          mv "$RUNNER_TEMP/FFDragPro" "$GITHUB_WORKSPACE/FFDragPro"
+          echo "Project has $(find "$dest" -type f | wc -l) files"
+          test -f "$dest/settings.gradle.kts"
 
       - uses: actions/setup-java@v4
         with:
